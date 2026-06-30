@@ -5,17 +5,31 @@ namespace BomWizard.Services;
 
 public static class SolidWorksBomUpdater
 {
-    private static readonly string[] ItemHeaderTerms = ["item", "item no", "item no.", "balloon", "balloon sequence", "seq"];
+    private static readonly string[] PartHeaders = ["P/N", "PN", "PART NUMBER", "PART NO", "PART NO.", "PARTNUMBER"];
+    private static readonly string[] DescriptionHeaders = ["DESCRIPTION 1", "DESCRIPTION", "DESC 1", "DESC"];
+    private static readonly string[] BSeqHeaders = ["BSEQ", "BALLOON SEQUENCE", "BALLOON", "ITEM", "ITEM NO", "ITEM NO.", "SEQ"];
+    private static readonly string[] OpSeqHeaders = ["OPSEQ", "OP SEQ", "OPERATION SEQUENCE", "OPERATION"];
 
-    public static BomUpdateResult UpdateActiveBom(IReadOnlyDictionary<string, BomSequenceEntry> sequences)
+    public static BomUpdateResult UpdateActiveBom(IReadOnlyList<BomSequenceEntry> entries)
     {
-        if (sequences.Count == 0)
+        return UpdateActiveBom(entries, BomUpdateOptions.Default);
+    }
+
+    public static BomUpdateResult UpdateActiveBom(IReadOnlyList<BomSequenceEntry> entries, BomUpdateOptions options)
+    {
+        if (entries.Count == 0)
         {
-            throw new InvalidOperationException("No Excel sequences were loaded.");
+            throw new InvalidOperationException("No Excel reference rows were loaded.");
         }
 
+        if (!options.UpdateBSeq && !options.UpdateOpSeq)
+        {
+            throw new InvalidOperationException("Select at least one value to update: BSEQ or OPSEQ.");
+        }
+
+        var reference = BomReference.Create(entries);
         var result = new BomUpdateResult();
-        var matchedParts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var matchedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var swApp = ActiveComObject.Get("SldWorks.Application");
         var activeDoc = ComDispatch.GetProperty(swApp, "ActiveDoc");
 
@@ -29,7 +43,7 @@ public static class SolidWorksBomUpdater
             foreach (var table in GetTableAnnotations(bomFeature))
             {
                 result.TablesScanned++;
-                UpdateTable(table, sequences, matchedParts, result);
+                UpdateTable(table, reference, options, matchedKeys, result);
             }
         }
 
@@ -38,9 +52,9 @@ public static class SolidWorksBomUpdater
             result.Messages.Add("No BOM tables were found in the active SolidWorks document.");
         }
 
-        foreach (var missing in sequences.Keys.Where(key => !matchedParts.Contains(key)).OrderBy(key => key))
+        foreach (var missing in entries.Where(entry => !matchedKeys.Contains(entry.CompositeKey)).OrderBy(entry => entry.BSeq))
         {
-            result.Messages.Add($"No matching BOM row found for Excel part number '{sequences[missing].PartNumber}'.");
+            result.Messages.Add($"No matching BOM row found for P/N '{missing.PartNumber}' / DESCRIPTION 1 '{missing.Description1}'.");
         }
 
         TryInvoke(activeDoc, "ForceRebuild3", false);
@@ -49,71 +63,162 @@ public static class SolidWorksBomUpdater
 
     private static void UpdateTable(
         object table,
-        IReadOnlyDictionary<string, BomSequenceEntry> sequences,
-        HashSet<string> matchedParts,
+        BomReference reference,
+        BomUpdateOptions options,
+        HashSet<string> matchedKeys,
         BomUpdateResult result)
     {
         var rowCount = ComDispatch.GetInt(table, "RowCount");
         var columnCount = ComDispatch.GetInt(table, "ColumnCount");
-        var itemColumn = FindItemColumn(table, rowCount, columnCount);
+        var columns = FindBomColumns(table, rowCount, columnCount);
 
-        for (var row = 1; row < rowCount; row++)
+        if (RequiresPartNumber(options.MatchMode) && columns.PartNumber is null)
         {
-            var matchKey = FindMatchingPartKey(table, row, columnCount, sequences);
-            if (matchKey is null)
+            result.Messages.Add("Skipped a BOM table because no P/N or part number column was found.");
+            return;
+        }
+
+        if (RequiresDescription(options.MatchMode) && columns.Description1 is null)
+        {
+            result.Messages.Add("Skipped a BOM table because no DESCRIPTION 1 column was found.");
+            return;
+        }
+
+        if (options.UpdateBSeq && columns.BSeq is null)
+        {
+            result.Messages.Add("A matching BOM table has no BSEQ/balloon/item column, so BSEQ values cannot be written.");
+        }
+
+        if (options.UpdateOpSeq && columns.OpSeq is null)
+        {
+            result.Messages.Add("A matching BOM table has no OPSEQ/operation sequence column, so OPSEQ values cannot be written.");
+        }
+
+        for (var row = columns.FirstDataRow; row < rowCount; row++)
+        {
+            var entry = FindMatchingEntry(table, row, columnCount, columns, reference, options);
+            if (entry is null)
             {
                 continue;
             }
 
-            var sequence = sequences[matchKey].Sequence;
-            SetCellText(table, row, itemColumn, sequence);
-            matchedParts.Add(matchKey);
+            var changedCells = 0;
+            if (options.UpdateBSeq && columns.BSeq is int bSeqColumn)
+            {
+                SetCellText(table, row, bSeqColumn, entry.BSeq);
+                changedCells++;
+            }
+
+            if (options.UpdateOpSeq && columns.OpSeq is int opSeqColumn)
+            {
+                SetCellText(table, row, opSeqColumn, entry.OpSeq);
+                changedCells++;
+            }
+
+            if (changedCells == 0)
+            {
+                continue;
+            }
+
+            matchedKeys.Add(entry.CompositeKey);
             result.RowsUpdated++;
-            result.Messages.Add($"Updated row {row + 1}: part '{sequences[matchKey].PartNumber}' -> balloon sequence '{sequence}'.");
+            result.CellsUpdated += changedCells;
+            result.Messages.Add($"Updated row {row + 1}: P/N '{entry.PartNumber}', BSEQ '{entry.BSeq}', OPSEQ '{entry.OpSeq}'.");
         }
 
         TryInvoke(table, "UpdateTableAnnotation");
     }
 
-    private static int FindItemColumn(object table, int rowCount, int columnCount)
+    private static BomColumns FindBomColumns(object table, int rowCount, int columnCount)
     {
-        var headerRowsToCheck = Math.Min(rowCount, 3);
+        var headerRowsToCheck = Math.Min(rowCount, 5);
 
         for (var row = 0; row < headerRowsToCheck; row++)
         {
+            int? partNumber = null;
+            int? description1 = null;
+            int? bSeq = null;
+            int? opSeq = null;
+
             for (var column = 0; column < columnCount; column++)
             {
-                var header = GetCellText(table, row, column);
-                if (ItemHeaderTerms.Any(term => header.Contains(term, StringComparison.OrdinalIgnoreCase)))
-                {
-                    return column;
-                }
+                var header = NormalizeHeader(GetCellText(table, row, column));
+
+                partNumber ??= MatchesAny(header, PartHeaders) ? column : null;
+                description1 ??= MatchesAny(header, DescriptionHeaders) ? column : null;
+                bSeq ??= MatchesAny(header, BSeqHeaders) ? column : null;
+                opSeq ??= MatchesAny(header, OpSeqHeaders) ? column : null;
+            }
+
+            if (partNumber is not null)
+            {
+                return new BomColumns(partNumber, description1, bSeq, opSeq, row + 1);
             }
         }
 
-        return 0;
+        return new BomColumns(null, null, null, null, 1);
     }
 
-    private static string? FindMatchingPartKey(
+    private static BomSequenceEntry? FindMatchingEntry(
         object table,
         int row,
         int columnCount,
-        IReadOnlyDictionary<string, BomSequenceEntry> sequences)
+        BomColumns columns,
+        BomReference reference,
+        BomUpdateOptions options)
     {
+        var partNumber = columns.PartNumber is int partColumn
+            ? GetComparableCell(table, row, partColumn)
+            : string.Empty;
+        var description1 = columns.Description1 is int descriptionColumn
+            ? GetComparableCell(table, row, descriptionColumn)
+            : string.Empty;
+
+        if (options.MatchMode is BomMatchMode.PartAndDescription or BomMatchMode.PartAndDescriptionThenDescription
+            && !string.IsNullOrWhiteSpace(partNumber)
+            && !string.IsNullOrWhiteSpace(description1))
+        {
+            var compositeKey = BomSequenceEntry.CreateCompositeKey(partNumber, description1);
+            if (reference.ByComposite.TryGetValue(compositeKey, out var entry))
+            {
+                return entry;
+            }
+        }
+
+        if (options.MatchMode is BomMatchMode.PartNumber
+            && !string.IsNullOrWhiteSpace(partNumber)
+            && reference.UniqueByPartNumber.TryGetValue(BomSequenceEntry.Normalize(partNumber), out var partOnlyEntry))
+        {
+            return partOnlyEntry;
+        }
+
+        if (options.MatchMode is BomMatchMode.Description or BomMatchMode.PartAndDescriptionThenDescription
+            && !string.IsNullOrWhiteSpace(description1)
+            && reference.UniqueByDescription1.TryGetValue(BomSequenceEntry.Normalize(description1), out var descriptionEntry))
+        {
+            return descriptionEntry;
+        }
+
         for (var column = 0; column < columnCount; column++)
         {
-            var cellText = GetCellText(table, row, column);
-            var normalized = ExcelBomReader.Normalize(cellText);
-
-            if (sequences.ContainsKey(normalized))
+            var cellText = GetComparableCell(table, row, column);
+            if (string.IsNullOrWhiteSpace(cellText))
             {
-                return normalized;
+                continue;
             }
 
-            var fileStem = Path.GetFileNameWithoutExtension(normalized);
-            if (!string.IsNullOrWhiteSpace(fileStem) && sequences.ContainsKey(fileStem))
+            if (options.MatchMode is BomMatchMode.PartNumber
+                && reference.UniqueByPartNumber.TryGetValue(BomSequenceEntry.Normalize(cellText), out var scannedEntry))
             {
-                return fileStem;
+                return scannedEntry;
+            }
+
+            var fileStem = Path.GetFileNameWithoutExtension(cellText);
+            if (options.MatchMode is BomMatchMode.PartNumber
+                && !string.IsNullOrWhiteSpace(fileStem)
+                && reference.UniqueByPartNumber.TryGetValue(BomSequenceEntry.Normalize(fileStem), out scannedEntry))
+            {
+                return scannedEntry;
             }
         }
 
@@ -180,6 +285,11 @@ public static class SolidWorksBomUpdater
         yield return annotations;
     }
 
+    private static string GetComparableCell(object table, int row, int column)
+    {
+        return BomSequenceEntry.Normalize(GetCellText(table, row, column));
+    }
+
     private static string GetCellText(object table, int row, int column)
     {
         try
@@ -217,6 +327,34 @@ public static class SolidWorksBomUpdater
         }
     }
 
+    private static string NormalizeHeader(string value)
+    {
+        return BomSequenceEntry.Normalize(value)
+            .Replace(".", string.Empty, StringComparison.Ordinal)
+            .Replace("/", string.Empty, StringComparison.Ordinal)
+            .ToUpperInvariant();
+    }
+
+    private static bool MatchesAny(string normalizedHeader, IEnumerable<string> candidates)
+    {
+        return candidates
+            .Select(NormalizeHeader)
+            .Any(candidate => normalizedHeader.Equals(candidate, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool RequiresPartNumber(BomMatchMode matchMode)
+    {
+        return matchMode is BomMatchMode.PartAndDescription
+            or BomMatchMode.PartNumber;
+    }
+
+    private static bool RequiresDescription(BomMatchMode matchMode)
+    {
+        return matchMode is BomMatchMode.PartAndDescription
+            or BomMatchMode.Description
+            or BomMatchMode.PartAndDescriptionThenDescription;
+    }
+
     private static object? TryInvoke(object target, string methodName, params object[] args)
     {
         return TryInvoke(target, methodName, out var value, args) ? value : null;
@@ -240,5 +378,41 @@ public static class SolidWorksBomUpdater
     {
         return ex is COMException or MissingMethodException
             || ex is TargetInvocationException { InnerException: COMException };
+    }
+
+    private sealed record BomColumns(int? PartNumber, int? Description1, int? BSeq, int? OpSeq, int FirstDataRow);
+
+    private sealed class BomReference
+    {
+        public Dictionary<string, BomSequenceEntry> ByComposite { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, BomSequenceEntry> UniqueByPartNumber { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, BomSequenceEntry> UniqueByDescription1 { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public static BomReference Create(IReadOnlyList<BomSequenceEntry> entries)
+        {
+            var reference = new BomReference();
+            foreach (var entry in entries)
+            {
+                reference.ByComposite[entry.CompositeKey] = entry;
+            }
+
+            foreach (var group in entries.GroupBy(entry => BomSequenceEntry.Normalize(entry.PartNumber), StringComparer.OrdinalIgnoreCase))
+            {
+                if (group.Count() == 1)
+                {
+                    reference.UniqueByPartNumber[group.Key] = group.Single();
+                }
+            }
+
+            foreach (var group in entries.GroupBy(entry => BomSequenceEntry.Normalize(entry.Description1), StringComparer.OrdinalIgnoreCase))
+            {
+                if (group.Count() == 1)
+                {
+                    reference.UniqueByDescription1[group.Key] = group.Single();
+                }
+            }
+
+            return reference;
+        }
     }
 }

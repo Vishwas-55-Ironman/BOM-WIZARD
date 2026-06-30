@@ -22,3 +22,4 @@ C:\Users\Administrator\OneDrive\C Sharp Projects\Using_Codex\BOM_WIZARD\BomWizar
 C:\Users\Administrator\OneDrive\C Sharp Projects\Using_Codex\BOM_WIZARD\BomWizard\obj\Debug\net8.0-windows\BomWizard.pdb
 C:\Users\Administrator\OneDrive\C Sharp Projects\Using_Codex\BOM_WIZARD\BomWizard\obj\Debug\net8.0-windows\BomWizard.genruntimeconfig.cache
 C:\Users\Administrator\OneDrive\C Sharp Projects\Using_Codex\BOM_WIZARD\BomWizard\obj\Debug\net8.0-windows\ref\BomWizard.dll
+C:\Users\Administrator\OneDrive\C Sharp Projects\Using_Codex\BOM_WIZARD\BomWizard\obj\Debug\net8.0-windows\BomWizard.sourcelink.json
